@@ -1,13 +1,21 @@
 """
-OpenMV 瑙嗚璇嗗埆鑴氭湰 - 鏀硅繘鐗?鍔熻兘锛氳瘑鍒粦鑹茶竟妗嗗唴鐨勭洰鏍囩墿浣擄紙鐭╁舰/鍦嗗舰/涓夎褰級锛屾祴璺濇祴灏哄锛屼覆鍙ｅ彂閫佹暟鎹?骞冲彴锛歄penMV (STM32/K210)
-鏀硅繘鏃ユ湡锛?026-06-10
+OpenMV 视觉识别脚本 - 改进版
+功能：识别黑色边框内的目标物体（矩形/圆形/三角形），测距测尺寸，串口发送数据
+平台：OpenMV (STM32/K210)
+改进日期：2026-06-10
 
-鏀硅繘鍐呭锛?- 淇 FRAME_HIGHT_MM 鎷煎啓閿欒 鈫?FRAME_HEIGHT_MM
-- 绉婚櫎鏃犵敤甯搁噺 FRAME_HEIGHT_PIXEL_2
-- CENTER_X / CENTER_Y 鏀逛负浠庡疄闄呯獥鍙ｅ昂瀵歌绠?- find_center_blob 鏀逛负缁熶竴鍑芥暟锛屾洿鍋ュ．鐨勫垵濮嬪寲閫昏緫
-- 褰㈢姸璇嗗埆澧炲姞 area 鍜?w/h 姣斿€艰緟鍔╁垽鏂紝鍑忓皯璇瘑鍒?- 璺濈璁＄畻澧炲姞闄ら浂淇濇姢
-- 鎻愬彇榄旀硶鏁板瓧鍒板父閲忥紝闆嗕腑绠＄悊闃堝€?- 澧炲姞 FPS 鏄剧ず
-- 澧炲姞 debug 妯″紡寮€鍏?- 缁熶竴寮傚父鐘舵€佺殑鏁版嵁鍖呭彂閫?"""
+改进内容：
+- 修复 FRAME_HIGHT_MM 拼写错误 → FRAME_HEIGHT_MM
+- 移除无用常量 FRAME_HEIGHT_PIXEL_2
+- CENTER_X / CENTER_Y 改为从实际窗口尺寸计算
+- find_center_blob 改为统一函数，更健壮的初始化逻辑
+- 形状识别增加 area 和 w/h 比值辅助判断，减少误识别
+- 距离计算增加除零保护
+- 提取魔法数字到常量，集中管理阈值
+- 增加 FPS 显示
+- 增加 debug 模式开关
+- 统一异常状态的数据包发送
+"""
 
 import sensor
 import time
@@ -15,95 +23,110 @@ from pyb import UART
 import lcd
 
 # ============================================================
-# 鍏ㄥ眬寮€鍏?# ============================================================
-DEBUG = True              # 璋冭瘯妯″紡锛歍rue 鎵撳嵃璇︾粏鏃ュ織锛孎alse 闈欓粯杩愯
+# 全局开关
+# ============================================================
+DEBUG = True              # 调试模式：True 打印详细日志，False 静默运行
 
 # ============================================================
-# 涓插彛鍒濆鍖?# ============================================================
-UART_CHANNEL = 3          # UART 閫氶亾
-UART_BAUD = 115200        # 娉㈢壒鐜?
+# 串口初始化
+# ============================================================
+UART_CHANNEL = 3          # UART 通道
+UART_BAUD = 115200        # 波特率
+
 lcd.init()
 uart = UART(UART_CHANNEL, UART_BAUD)
 uart.init(UART_BAUD, bits=8, parity=None, stop=1)
 
 # ============================================================
-# 鏁版嵁鍖呭崗璁畾涔?# ============================================================
-PACKET_HEADER = 0xAA  # 鍖呭ご
-PACKET_TAIL = 0x55    # 鍖呭熬
+# 数据包协议定义
+# ============================================================
+PACKET_HEADER = 0xAA  # 包头
+PACKET_TAIL = 0x55    # 包尾
 
-# 褰㈢姸缂栫爜
-SHAPE_NONE = 0        # 鏈瘑鍒?SHAPE_RECTANGLE = 1   # 鐭╁舰
-SHAPE_CIRCLE = 2      # 鍦嗗舰
-SHAPE_TRIANGLE = 3    # 涓夎褰?
-# 褰㈢姸鍚嶇О鏄犲皠
+# 形状编码
+SHAPE_NONE = 0        # 未识别
+SHAPE_RECTANGLE = 1   # 矩形
+SHAPE_CIRCLE = 2      # 圆形
+SHAPE_TRIANGLE = 3    # 三角形
+
+# 形状名称映射
 SHAPE_NAMES = {
-    SHAPE_NONE: "鏈瘑鍒?,
-    SHAPE_RECTANGLE: "鐭╁舰",
-    SHAPE_CIRCLE: "鍦嗗舰",
-    SHAPE_TRIANGLE: "涓夎褰?,
+    SHAPE_NONE: "未识别",
+    SHAPE_RECTANGLE: "矩形",
+    SHAPE_CIRCLE: "圆形",
+    SHAPE_TRIANGLE: "三角形",
 }
 
 # ============================================================
-# 鎽勫儚澶村垵濮嬪寲
+# 摄像头初始化
 # ============================================================
 sensor.reset()
 sensor.set_pixformat(sensor.GRAYSCALE)
 sensor.set_framesize(sensor.VGA)        # 640x480
-sensor.set_windowing((230, 300))        # 瑁佸壀涓棿 230x300 鍖哄煙
+sensor.set_windowing((230, 300))        # 裁剪中间 230x300 区域
 sensor.skip_frames(time=2000)
 clock = time.clock()
 sensor.set_vflip(1)
 sensor.set_hmirror(1)
 sensor.skip_frames(30)
 
-# 璁＄畻鐢婚潰涓績锛堝熀浜庡疄闄呰鍓昂瀵革級
+# 计算画面中心（基于实际裁剪尺寸）
 IMAGE_W, IMAGE_H = 230, 300
 CENTER_X = IMAGE_W // 2
 CENTER_Y = IMAGE_H // 2
 
 # ============================================================
-# 鏍″噯鍙傛暟
+# 校准参数
 # ============================================================
-# 杈规鐪熷疄灏哄 (mm)
+# 边框真实尺寸 (mm)
 FRAME_WIDTH_MM = 180
 FRAME_HEIGHT_MM = 255
 
-# 璺濈鏍″噯鐐癸細璺濈 2000mm 鏃讹紝杈规瀹藉害涓?89 鍍忕礌
-# 渚嬪锛氬綋璺濈鏄?1100mm 鏃讹紝杈规瀹藉害涓?104 鍍忕礌
+# 距离校准点：距离 2000mm 时，边框宽度为 89 像素
+# 例如：当距离是 1100mm 时，边框宽度为 104 像素
 DISTANCE_CAL_MM = 2000
 FRAME_WIDTH_CAL_PX = 89
 
 # ============================================================
-# 鍥惧儚澶勭悊闃堝€?# ============================================================
-# 鑹插潡鎼滅储鐏板害鑼冨洿
-WHITE_THRESHOLD = (150, 256)    # 鐧借壊锛堣竟妗嗗唴閮級
-BLACK_THRESHOLD = (0, 150)      # 榛戣壊锛堢洰鏍囩墿浣擄級
-# 娉細鍙崟鐙皟鏁寸洰鏍囩墿浣撻槇鍊硷紝渚嬪 (0, 80) 浠呰瘑鍒繁榛戣壊鐗╀綋
+# 图像处理阈值
+# ============================================================
+# 色块搜索灰度范围
+WHITE_THRESHOLD = (150, 256)    # 白色（边框内部）
+BLACK_THRESHOLD = (0, 150)      # 黑色（目标物体）
+# 注：可单独调整目标物体阈值，例如 (0, 80) 仅识别深黑色物体
 
-# 涓績鍋忕Щ瀹瑰繊搴︼紙璺濅腑蹇?Manhattan 璺濈涓婇檺锛屽儚绱狅級
+# 中心偏移容忍度（距中心 Manhattan 距离上限，像素）
 CENTER_TOLERANCE = 50
 
-# 鏈€灏忚壊鍧楅潰绉紙婊ゆ尝鍣０锛?MIN_BLOB_AREA = 20
+# 最小色块面积（滤波噪声）
+MIN_BLOB_AREA = 20
 
-# ROI 鏀剁缉閲忥紙鍘婚櫎榛戞榛戣竟锛屽儚绱狅級
+# ROI 收缩量（去除黑框黑边，像素）
 ROI_SHRINK_X = 5
 ROI_SHRINK_Y = 5
-ROI_SHRINK_W = 10   # 鎬绘敹缂╁搴?= shrink_x * 2
-ROI_SHRINK_H = 10   # 鎬绘敹缂╅珮搴?= shrink_y * 2
+ROI_SHRINK_W = 10   # 总收缩宽度 = shrink_x * 2
+ROI_SHRINK_H = 10   # 总收缩高度 = shrink_y * 2
 
-# 褰㈢姸璇嗗埆闃堝€?DENSITY_RECT = 0.90   # density > 姝ゅ€?鈫?鐭╁舰
-DENSITY_CIRC = 0.60   # density > 姝ゅ€?鈫?鍦嗗舰锛堜笖 鈮?RECT锛?DENSITY_TRI = 0.40    # density > 姝ゅ€?鈫?涓夎褰紙涓?鈮?CIRC锛?# 杈呭姪锛氬楂樻瘮鐢ㄤ簬鍖哄垎鐭╁舰鍜屽渾褰?ASPECT_RATIO_RECT_MIN = 0.70   # 鐭╁舰 w/h 鑷冲皯灏忎簬姝ゅ€硷紙瓒婄獎瓒婂儚鐭╁舰锛?ASPECT_RATIO_RECT_MAX = 1.30
+# 形状识别阈值
+DENSITY_RECT = 0.90   # density > 此值 → 矩形
+DENSITY_CIRC = 0.60   # density > 此值 → 圆形（且 ≤ RECT）
+DENSITY_TRI = 0.40    # density > 此值 → 三角形（且 ≤ CIRC）
+# 辅助：宽高比用于区分矩形和圆形
+ASPECT_RATIO_RECT_MIN = 0.70   # 矩形 w/h 至少小于此值（越窄越像矩形）
+ASPECT_RATIO_RECT_MAX = 1.30
 
-# 涓诲惊鐜欢鏃?(ms)
+# 主循环延时 (ms)
 LOOP_DELAY_MS = 500
 
 # ============================================================
-# 杈呭姪鍑芥暟
+# 辅助函数
 # ============================================================
 
 def find_center_blob(blobs, mode="max"):
     """
-    鍦ㄧ敾闈腑蹇冨尯鍩熷唴鎵捐壊鍧椼€?    mode: "max" 鎵炬渶澶? "min" 鎵炬渶灏?    杩斿洖鎵惧埌鐨?blob 鎴?None
+    在画面中心区域内找色块。
+    mode: "max" 找最大, "min" 找最小
+    返回找到的 blob 或 None
     """
     if not blobs:
         return None
@@ -115,9 +138,11 @@ def find_center_blob(blobs, mode="max"):
         best_value = float('inf')
 
     for b in blobs:
-        # 杩囨护涓績鍖哄煙浠ュ鐨勮壊鍧?        if abs(b.cx() - CENTER_X) + abs(b.cy() - CENTER_Y) > CENTER_TOLERANCE:
+        # 过滤中心区域以外的色块
+        if abs(b.cx() - CENTER_X) + abs(b.cy() - CENTER_Y) > CENTER_TOLERANCE:
             continue
-        # 杩囨护杩囧皬鐨勫櫔鐐?        if b.area() < MIN_BLOB_AREA:
+        # 过滤过小的噪点
+        if b.area() < MIN_BLOB_AREA:
             continue
 
         if mode == "max":
@@ -134,8 +159,9 @@ def find_center_blob(blobs, mode="max"):
 
 def calc_distance(frame_width_px):
     """
-    鏍规嵁杈规鍍忕礌瀹藉害璁＄畻璺濈 (mm)銆?    鍩轰簬鐩镐技涓夎褰㈠師鐞嗭細distance 鈭?1/width
-    杩斿洖 NaN 琛ㄧず鏃犳晥娴嬮噺
+    根据边框像素宽度计算距离 (mm)。
+    基于相似三角形原理：distance ∝ 1/width
+    返回 NaN 表示无效测量
     """
     if frame_width_px <= 0:
         return float('nan')
@@ -143,7 +169,7 @@ def calc_distance(frame_width_px):
 
 
 def calc_object_size_mm(obj_px, frame_px):
-    """鏍规嵁鐗╀綋鍍忕礌/杈规鍍忕礌姣斾緥璁＄畻鐗╀綋瀹為檯灏哄 (mm)"""
+    """根据物体像素/边框像素比例计算物体实际尺寸 (mm)"""
     if frame_px <= 0:
         return 0.0
     return obj_px / frame_px * FRAME_WIDTH_MM
@@ -151,24 +177,26 @@ def calc_object_size_mm(obj_px, frame_px):
 
 def classify_shape(blob):
     """
-    鍩轰簬 density锛堝瘑瀹炲害 = area / bounding_box_area锛夊拰
-    w/h 姣斿€煎垽鏂舰鐘躲€?    杩斿洖 (shape_code, shape_name)
+    基于 density（密实度 = area / bounding_box_area）和
+    w/h 比值判断形状。
+    返回 (shape_code, shape_name)
     """
     density = blob.density()
 
-    # 榛樿鏈煡褰㈢姸
+    # 默认未知形状
     shape_code = SHAPE_NONE
 
     if density > DENSITY_RECT:
         shape_code = SHAPE_RECTANGLE
     elif density > DENSITY_CIRC:
-        # 杈呭姪鍒ゆ柇锛氬渾褰?w/h 鎺ヨ繎 1:1
+        # 辅助判断：圆形 w/h 接近 1:1
         w, h = blob.w(), blob.h()
         ratio = w / h if h > 0 else 0
         if ASPECT_RATIO_RECT_MIN < ratio < ASPECT_RATIO_RECT_MAX:
             shape_code = SHAPE_CIRCLE
         else:
-            # 瀵嗗害鎺ヨ繎鐭╁舰浣?w/h 涓嶆帴杩?1 鈫?鏇村彲鑳芥槸鐭╁舰鏉?            shape_code = SHAPE_RECTANGLE
+            # 密度接近矩形但 w/h 不接近 1 → 更可能是矩形条
+            shape_code = SHAPE_RECTANGLE
     elif density > DENSITY_TRI:
         shape_code = SHAPE_TRIANGLE
 
@@ -177,14 +205,17 @@ def classify_shape(blob):
 
 def send_packet(shape_code, distance_mm, length_mm):
     """
-    閫氳繃涓插彛鍙戦€佹暟鎹寘銆?    鍗忚锛歔0xAA] [shape_code] [distance_H] [distance_L] [length_H] [length_L] [0x55]
-    distance 鍜?length 浠?1 浣嶅皬鏁扮簿搴︾紪鐮侊紙鍊?* 10 鍚庢媶涓?2 瀛楄妭澶х锛?    """
+    通过串口发送数据包。
+    协议：[0xAA] [shape_code] [distance_H] [distance_L] [length_H] [length_L] [0x55]
+    distance 和 length 以 1 位小数精度编码（值 * 10 后拆为 2 字节大端）
+    """
     try:
-        # 娴偣 鈫?鏁存暟锛堜繚鐣?1 浣嶅皬鏁帮級
+        # 浮点 → 整数（保留 1 位小数）
         dist_int = int(round(distance_mm * 10))
         len_int = int(round(length_mm * 10))
 
-        # 闄愬箙锛岄槻姝㈡孩鍑?        dist_int = max(0, min(65535, dist_int))
+        # 限幅，防止溢出
+        dist_int = max(0, min(65535, dist_int))
         len_int = max(0, min(65535, len_int))
 
         packet = bytes([
@@ -204,36 +235,39 @@ def send_packet(shape_code, distance_mm, length_mm):
                      distance_mm, length_mm))
 
     except Exception as e:
-        print("涓插彛鍙戦€侀敊璇? %s" % e)
+        print("串口发送错误: %s" % e)
 
 
 def draw_overlay(img, frame_blob, obj_blob, shape_name, distance, obj_size):
-    """鍦ㄥ浘鍍忎笂缁樺埗妫€娴嬬粨鏋滃拰杈圭晫妗?""
-    # 杈规妗?    if frame_blob:
+    """在图像上绘制检测结果和边界框"""
+    # 边框框
+    if frame_blob:
         img.draw_rectangle(frame_blob.rect(), color=255, thickness=2)
-    # 鐗╀綋妗?    if obj_blob:
+    # 物体框
+    if obj_blob:
         img.draw_rectangle(obj_blob.rect(), color=0, thickness=2)
 
-    # 淇℃伅鍙犲姞
+    # 信息叠加
     img.draw_string(10, 10, "shape:%s" % shape_name)
     img.draw_string(10, 22, "dist:%.0fmm" % distance)
     img.draw_string(10, 34, "size:%.0fmm" % obj_size)
 
-    # 涓績鍗佸瓧
+    # 中心十字
     img.draw_cross(CENTER_X, CENTER_Y, color=128, size=5)
 
 # ============================================================
-# 涓诲惊鐜?# ============================================================
+# 主循环
+# ============================================================
 
 while True:
     clock.tick()
     img = sensor.snapshot()
 
     # --------------------------------------------------------
-    # 1. 鎵剧櫧鑹插尯鍩?鈫?璇嗗埆榛戣壊杈规
+    # 1. 找白色区域 → 识别黑色边框
     # --------------------------------------------------------
     frames = img.find_blobs([WHITE_THRESHOLD])
-    frame_blob = find_center_blob(frames, mode="min")  # 鎵炬渶灏忕殑鐧借壊鍧?= 杈规鍐呴儴
+    frame_blob = find_center_blob(frames, mode="min")  # 找最小的白色块 = 边框内部
 
     if not frame_blob:
         print("NO FRAME")
@@ -243,15 +277,17 @@ while True:
         continue
 
     # --------------------------------------------------------
-    # 2. 璁＄畻璺濈
+    # 2. 计算距离
     # --------------------------------------------------------
     distance = calc_distance(frame_blob.w())
-    if distance != distance:  # NaN 妫€鏌?        print("DISTANCE ERROR: frame_w=%d" % frame_blob.w())
+    if distance != distance:  # NaN 检查
+        print("DISTANCE ERROR: frame_w=%d" % frame_blob.w())
         send_packet(SHAPE_NONE, 0, 0)
         continue
 
     # --------------------------------------------------------
-    # 3. 鏀剁缉 ROI锛堟帓闄ら粦妗嗙殑榛戣竟锛?    # --------------------------------------------------------
+    # 3. 收缩 ROI（排除黑框的黑边）
+    # --------------------------------------------------------
     roi_x = frame_blob.x() + ROI_SHRINK_X
     roi_y = frame_blob.y() + ROI_SHRINK_Y
     roi_w = frame_blob.w() - ROI_SHRINK_W
@@ -265,10 +301,11 @@ while True:
         continue
 
     # --------------------------------------------------------
-    # 4. 鎵鹃粦鑹茶壊鍧?鈫?鐩爣鐗╀綋
+    # 4. 找黑色色块 → 目标物体
     # --------------------------------------------------------
     objs = img.find_blobs([BLACK_THRESHOLD], roi=(roi_x, roi_y, roi_w, roi_h))
-    obj_blob = find_center_blob(objs, mode="max")  # 鎵炬渶澶х殑榛戣壊鍧?
+    obj_blob = find_center_blob(objs, mode="max")  # 找最大的黑色块
+
     if not obj_blob:
         print("NO OBJECT")
         send_packet(SHAPE_NONE, distance, 0)
@@ -277,7 +314,7 @@ while True:
         continue
 
     # --------------------------------------------------------
-    # 5. 璁＄畻鐗╀綋灏哄 & 鍒嗙被褰㈢姸
+    # 5. 计算物体尺寸 & 分类形状
     # --------------------------------------------------------
     obj_size_mm = calc_object_size_mm(obj_blob.w(), frame_blob.w())
     shape_code, shape_name = classify_shape(obj_blob)
@@ -288,7 +325,7 @@ while True:
               % (fps, shape_name, distance, obj_size_mm, obj_blob.density()))
 
     # --------------------------------------------------------
-    # 6. 涓插彛鍙戦€?鈫?鏄剧ず
+    # 6. 串口发送 → 显示
     # --------------------------------------------------------
     send_packet(shape_code, distance, obj_size_mm)
     draw_overlay(img, frame_blob, obj_blob, shape_name, distance, obj_size_mm)
